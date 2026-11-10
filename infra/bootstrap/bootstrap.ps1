@@ -127,7 +127,6 @@ if ($MyInvocation.InvocationName -ne '.') {
         ) | Out-Null
 
         $roleScope = $rg.id
-        if (-not $roleScope) { throw 'TODO(Will): set $roleScope' }
 
         Invoke-Az @(
             'role', 'assignment', 'create',
@@ -137,13 +136,31 @@ if ($MyInvocation.InvocationName -ne '.') {
             '--scope', $roleScope
         ) | Out-Null
 
+        # Same identity and scope, separate trust path: <env>-destroy has no reviewer so the nightly schedule can run.
+        $destroyEnv = "$envName-destroy"
+        Invoke-Az @(
+            'identity', 'federated-credential', 'create',
+            '--name', "github-$destroyEnv",
+            '--identity-name', $identityName,
+            '--resource-group', $BootstrapResourceGroup,
+            '--issuer', 'https://token.actions.githubusercontent.com',
+            '--subject', "${subPrefix}:environment:$destroyEnv",
+            '--audiences', 'api://AzureADTokenExchange'
+        ) | Out-Null
+
         Write-Host "[$envName] rg=$rgName identity=$identityName clientId=$($identity.clientId)"
 
         if ($ConfigureGitHub) {
-            Invoke-Gh @('api', '--method', 'PUT', "repos/$GitHubRepo/environments/$envName", '--silent')
-            Invoke-Gh @('secret', 'set', 'AZURE_CLIENT_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $identity.clientId)
-            Invoke-Gh @('secret', 'set', 'AZURE_TENANT_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $account.tenantId)
-            Invoke-Gh @('secret', 'set', 'AZURE_SUBSCRIPTION_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $SubscriptionId)
+            foreach ($ghEnv in @($envName, $destroyEnv)) {
+                # Create only if missing, so re-runs never reset reviewers or branch policies.
+                & gh api "repos/$GitHubRepo/environments/$ghEnv" --silent 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    Invoke-Gh @('api', '--method', 'PUT', "repos/$GitHubRepo/environments/$ghEnv", '--silent')
+                }
+                Invoke-Gh @('secret', 'set', 'AZURE_CLIENT_ID', '--repo', $GitHubRepo, '--env', $ghEnv, '--body', $identity.clientId)
+                Invoke-Gh @('secret', 'set', 'AZURE_TENANT_ID', '--repo', $GitHubRepo, '--env', $ghEnv, '--body', $account.tenantId)
+                Invoke-Gh @('secret', 'set', 'AZURE_SUBSCRIPTION_ID', '--repo', $GitHubRepo, '--env', $ghEnv, '--body', $SubscriptionId)
+            }
         }
     }
 
