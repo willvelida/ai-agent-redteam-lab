@@ -27,6 +27,11 @@
     Holds the deploy identities. Deliberately outside the rg-ailab3-* pattern so destroy.yml can never touch it.
 .PARAMETER ConfigureGitHub
     Also create the GitHub environments and set AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID secrets via gh.
+.PARAMETER BudgetAlertEmail
+    If set, deploys the subscription budget (infra/modules/budget.bicep) with alerts to this address.
+    Kept out of the pipeline so a compromised deploy identity can't silence its own cost alarm.
+.PARAMETER BudgetAmount
+    Monthly budget in the subscription billing currency.
 .EXAMPLE
     ./infra/bootstrap/bootstrap.ps1 -SubscriptionId <id> -ConfigureGitHub
 .NOTES
@@ -50,7 +55,14 @@ param(
     [string]$BootstrapResourceGroup = 'rg-redteamlab-bootstrap',
 
     [Parameter(Mandatory = $false)]
-    [switch]$ConfigureGitHub
+    [switch]$ConfigureGitHub,
+
+    [Parameter(Mandatory = $false)]
+    [string]$BudgetAlertEmail,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 100000)]
+    [int]$BudgetAmount = 80
 )
 
 $ErrorActionPreference = 'Stop'
@@ -133,6 +145,18 @@ if ($MyInvocation.InvocationName -ne '.') {
             Invoke-Gh @('secret', 'set', 'AZURE_TENANT_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $account.tenantId)
             Invoke-Gh @('secret', 'set', 'AZURE_SUBSCRIPTION_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $SubscriptionId)
         }
+    }
+
+    if ($BudgetAlertEmail) {
+        $budgetTemplate = Join-Path $PSScriptRoot '..' 'modules' 'budget.bicep'
+        Invoke-Az @(
+            'deployment', 'sub', 'create',
+            '--name', 'ailab3-budget',
+            '--location', $Location,
+            '--template-file', $budgetTemplate,
+            '--parameters', "amount=$BudgetAmount", "alertEmail=$BudgetAlertEmail"
+        ) | Out-Null
+        Write-Host "Budget deployed: $BudgetAmount/month (subscription billing currency)."
     }
 
     Write-Host 'Bootstrap complete. Next: protect the GitHub environments and branch-protect main.'
