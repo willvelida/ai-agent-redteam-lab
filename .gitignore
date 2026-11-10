@@ -451,3 +451,6 @@ attacks/garak/reports/*
 *.duckdb
 results/raw/*
 pyrit.db
+# Personal lab notes (kept local)
+ETHICS.md
+LAB-PROGRESS.md

@@ -87,6 +87,13 @@ if ($MyInvocation.InvocationName -ne '.') {
 
     Invoke-Az (@('group', 'create', '--name', $BootstrapResourceGroup, '--location', $Location, '--tags') + $tags) | Out-Null
 
+    # Ask GitHub for the exact sub prefix it will send. Repos may use immutable subjects
+    # (owner@<id>/repo@<id>), which a hand-built "repo:owner/name" string would never match.
+    $subPrefix = "repo:$GitHubRepo"
+    $oidcSub = & gh api "repos/$GitHubRepo/actions/oidc/customization/sub" 2>$null | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -and $oidcSub.sub_claim_prefix) { $subPrefix = $oidcSub.sub_claim_prefix }
+    Write-Host "OIDC sub prefix: $subPrefix"
+
     foreach ($envName in $Environments) {
         $rgName = "rg-ailab3-$envName"
         $identityName = "id-ailab3-gh-$envName"
@@ -95,8 +102,7 @@ if ($MyInvocation.InvocationName -ne '.') {
 
         $identity = Invoke-Az @('identity', 'create', '--name', $identityName, '--resource-group', $BootstrapResourceGroup, '--location', $Location)
 
-        $subject = "repo:$GitHubRepo" + ":environment:$envName"
-        if (-not $subject) { throw 'TODO(Will): set $subject' }
+        $subject = "${subPrefix}:environment:$envName"
 
         Invoke-Az @(
             'identity', 'federated-credential', 'create',
