@@ -27,6 +27,11 @@
     Holds the deploy identities. Deliberately outside the rg-ailab3-* pattern so destroy.yml can never touch it.
 .PARAMETER ConfigureGitHub
     Also create the GitHub environments and set AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID secrets via gh.
+.PARAMETER BudgetAlertEmail
+    If set, deploys the subscription budget (infra/modules/budget.bicep) with alerts to this address.
+    Kept out of the pipeline so a compromised deploy identity can't silence its own cost alarm.
+.PARAMETER BudgetAmount
+    Monthly budget in the subscription billing currency.
 .EXAMPLE
     ./infra/bootstrap/bootstrap.ps1 -SubscriptionId <id> -ConfigureGitHub
 .NOTES
@@ -50,7 +55,14 @@ param(
     [string]$BootstrapResourceGroup = 'rg-redteamlab-bootstrap',
 
     [Parameter(Mandatory = $false)]
-    [switch]$ConfigureGitHub
+    [switch]$ConfigureGitHub,
+
+    [Parameter(Mandatory = $false)]
+    [string]$BudgetAlertEmail,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 100000)]
+    [int]$BudgetAmount = 80
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,6 +99,13 @@ if ($MyInvocation.InvocationName -ne '.') {
 
     Invoke-Az (@('group', 'create', '--name', $BootstrapResourceGroup, '--location', $Location, '--tags') + $tags) | Out-Null
 
+    # Ask GitHub for the exact sub prefix it will send. Repos may use immutable subjects
+    # (owner@<id>/repo@<id>), which a hand-built "repo:owner/name" string would never match.
+    $subPrefix = "repo:$GitHubRepo"
+    $oidcSub = & gh api "repos/$GitHubRepo/actions/oidc/customization/sub" 2>$null | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -and $oidcSub.sub_claim_prefix) { $subPrefix = $oidcSub.sub_claim_prefix }
+    Write-Host "OIDC sub prefix: $subPrefix"
+
     foreach ($envName in $Environments) {
         $rgName = "rg-ailab3-$envName"
         $identityName = "id-ailab3-gh-$envName"
@@ -95,8 +114,7 @@ if ($MyInvocation.InvocationName -ne '.') {
 
         $identity = Invoke-Az @('identity', 'create', '--name', $identityName, '--resource-group', $BootstrapResourceGroup, '--location', $Location)
 
-        $subject = "repo:$GitHubRepo" + ":environment:$envName"
-        if (-not $subject) { throw 'TODO(Will): set $subject' }
+        $subject = "${subPrefix}:environment:$envName"
 
         Invoke-Az @(
             'identity', 'federated-credential', 'create',
@@ -109,7 +127,6 @@ if ($MyInvocation.InvocationName -ne '.') {
         ) | Out-Null
 
         $roleScope = $rg.id
-        if (-not $roleScope) { throw 'TODO(Will): set $roleScope' }
 
         Invoke-Az @(
             'role', 'assignment', 'create',
@@ -119,14 +136,44 @@ if ($MyInvocation.InvocationName -ne '.') {
             '--scope', $roleScope
         ) | Out-Null
 
+        # Same identity and scope, separate trust path: <env>-destroy has no reviewer so the nightly schedule can run.
+        $destroyEnv = "$envName-destroy"
+        Invoke-Az @(
+            'identity', 'federated-credential', 'create',
+            '--name', "github-$destroyEnv",
+            '--identity-name', $identityName,
+            '--resource-group', $BootstrapResourceGroup,
+            '--issuer', 'https://token.actions.githubusercontent.com',
+            '--subject', "${subPrefix}:environment:$destroyEnv",
+            '--audiences', 'api://AzureADTokenExchange'
+        ) | Out-Null
+
         Write-Host "[$envName] rg=$rgName identity=$identityName clientId=$($identity.clientId)"
 
         if ($ConfigureGitHub) {
-            Invoke-Gh @('api', '--method', 'PUT', "repos/$GitHubRepo/environments/$envName", '--silent')
-            Invoke-Gh @('secret', 'set', 'AZURE_CLIENT_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $identity.clientId)
-            Invoke-Gh @('secret', 'set', 'AZURE_TENANT_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $account.tenantId)
-            Invoke-Gh @('secret', 'set', 'AZURE_SUBSCRIPTION_ID', '--repo', $GitHubRepo, '--env', $envName, '--body', $SubscriptionId)
+            foreach ($ghEnv in @($envName, $destroyEnv)) {
+                # Create only if missing, so re-runs never reset reviewers or branch policies.
+                & gh api "repos/$GitHubRepo/environments/$ghEnv" --silent 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    Invoke-Gh @('api', '--method', 'PUT', "repos/$GitHubRepo/environments/$ghEnv", '--silent')
+                }
+                Invoke-Gh @('secret', 'set', 'AZURE_CLIENT_ID', '--repo', $GitHubRepo, '--env', $ghEnv, '--body', $identity.clientId)
+                Invoke-Gh @('secret', 'set', 'AZURE_TENANT_ID', '--repo', $GitHubRepo, '--env', $ghEnv, '--body', $account.tenantId)
+                Invoke-Gh @('secret', 'set', 'AZURE_SUBSCRIPTION_ID', '--repo', $GitHubRepo, '--env', $ghEnv, '--body', $SubscriptionId)
+            }
         }
+    }
+
+    if ($BudgetAlertEmail) {
+        $budgetTemplate = Join-Path $PSScriptRoot '..' 'modules' 'budget.bicep'
+        Invoke-Az @(
+            'deployment', 'sub', 'create',
+            '--name', 'ailab3-budget',
+            '--location', $Location,
+            '--template-file', $budgetTemplate,
+            '--parameters', "amount=$BudgetAmount", "alertEmail=$BudgetAlertEmail"
+        ) | Out-Null
+        Write-Host "Budget deployed: $BudgetAmount/month (subscription billing currency)."
     }
 
     Write-Host 'Bootstrap complete. Next: protect the GitHub environments and branch-protect main.'

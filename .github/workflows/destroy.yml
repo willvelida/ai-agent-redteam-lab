@@ -1,0 +1,70 @@
+name: Destroy lab environments
+
+on:
+  schedule:
+    # 14:00 UTC = 01:00 AEDT / 00:00 AEST
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Lab environment to empty
+        type: choice
+        options:
+          - vulnerable
+          - hardened
+
+permissions:
+  contents: read
+
+jobs:
+  destroy:
+    name: Destroy ${{ matrix.env }}
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(github.event_name == 'schedule' && '["vulnerable","hardened"]' || format('["{0}"]', inputs.environment)) }}
+    runs-on: ubuntu-latest
+    # Separate environment and federated credential from deploy: main-only, but no reviewer, so the schedule runs unattended.
+    environment: ${{ matrix.env }}-destroy
+    permissions:
+      contents: read
+      id-token: write
+    # Shares deploy.yml's group so a teardown never runs halfway through a deployment.
+    concurrency:
+      group: deploy-${{ matrix.env }}
+      cancel-in-progress: false
+    env:
+      RESOURCE_GROUP: rg-ailab3-${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Azure login (OIDC, no stored credentials)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Read keep tag
+        id: keep
+        run: |
+          keep=$(az group show --name "$RESOURCE_GROUP" --query "tags.keep" -o tsv)
+          echo "keep=${keep,,}" >> "$GITHUB_OUTPUT"
+          echo "Resources before teardown:"
+          az resource list --resource-group "$RESOURCE_GROUP" --query "[].{name:name, type:type}" -o table
+
+      - name: Empty resource group (Complete mode)
+        # Hint: an `if:` expression comparing the output of the step with id "keep". The value is lower-cased above.
+        if: steps.keep.outputs.keep != 'true'
+        run: |
+          az deployment group create \
+            --name "teardown-${{ github.run_id }}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/teardown.bicep \
+            --mode Complete
+          echo "Resources after teardown:"
+          az resource list --resource-group "$RESOURCE_GROUP" --query "[].{name:name, type:type}" -o table
+
+      - name: Report kept environment
+        if: steps.keep.outputs.keep == 'true'
+        run: echo "::warning::$RESOURCE_GROUP is tagged keep=true and was not emptied. It is still costing money."

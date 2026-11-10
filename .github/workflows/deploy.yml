@@ -32,6 +32,8 @@ jobs:
       - name: Build template and parameter files
         run: |
           az bicep build --file infra/main.bicep --stdout > /dev/null
+          az bicep build --file infra/modules/budget.bicep --stdout > /dev/null
+          az bicep build --file infra/teardown.bicep --stdout > /dev/null
           az bicep build-params --file infra/params/vulnerable.bicepparam --stdout > /dev/null
           az bicep build-params --file infra/params/hardened.bicepparam --stdout > /dev/null
 
