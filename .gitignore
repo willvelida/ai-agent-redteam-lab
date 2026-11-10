@@ -426,3 +426,28 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# ============================================================
+# AI Agent Red-Team Lab
+# ============================================================
+
+# Local secrets and environment files (*.env above covers ".env" and "foo.env")
+.env.*
+!.env.example
+*.secrets.json
+appsettings.*.local.json
+
+# Python virtual environments and tooling caches
+.venv/
+venv*/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Red-team artifacts: payload results, model outputs, tool memory
+attacks/garak/reports/*
+*.report.jsonl
+*.hitlog.jsonl
+*.db  
+*.duckdb
+results/raw/*
+pyrit.db

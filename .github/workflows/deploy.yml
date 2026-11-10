@@ -1,0 +1,76 @@
+name: Deploy lab environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Lab environment to deploy
+        type: choice
+        options:
+          - vulnerable
+          - hardened
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/deploy.yml'
+
+# Least privilege by default. Only the deploy job may request an OIDC token.
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.environment || 'pr' }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Build Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Build template and parameter files
+        run: |
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          az bicep build-params --file infra/params/vulnerable.bicepparam --stdout > /dev/null
+          az bicep build-params --file infra/params/hardened.bicepparam --stdout > /dev/null
+
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    needs: lint
+    # Pull requests only lint. They never reach Azure.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      RESOURCE_GROUP: rg-ailab3-${{ inputs.environment }}
+      PARAMS_FILE: infra/params/${{ inputs.environment }}.bicepparam
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Azure login (OIDC, no stored credentials)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if
+        run: |
+          az deployment group what-if \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters "$PARAMS_FILE"
+
+      - name: Deploy
+        run: |
+          az deployment group create \
+            --name "lab-${{ inputs.environment }}-${{ github.run_id }}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters "$PARAMS_FILE" \
+            --query properties.outputs.labConfig.value
